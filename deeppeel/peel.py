@@ -1,4 +1,4 @@
-"""深度剥离透明合成（depth peeling）的离线参考实现骨架。
+"""深度剥离透明合成（depth peeling）的离线参考实现。
 
 数据约定
 --------
@@ -13,8 +13,22 @@
 实现约束
 --------
 - 只使用标准库 ``math``；不要修改输入 list 或片元 dict。
-- 所有函数当前都是桩，必须按 docstring 契约实现。
 """
+
+TOL = 1e-9
+
+
+def _over(src, dst):
+    """预乘 alpha 的 over 合成：src over dst，alpha 只乘一次。"""
+    sr, sg, sb, sa = src
+    dr, dg, db, da = dst
+    one_minus_a = 1.0 - sa
+    return (
+        sr + dr * one_minus_a,
+        sg + dg * one_minus_a,
+        sb + db * one_minus_a,
+        sa + da * one_minus_a,
+    )
 
 
 def sort_layers(fragments):
@@ -35,7 +49,24 @@ def sort_layers(fragments):
     ----
     1e-9。
     """
-    raise NotImplementedError
+    # 按输入顺序把容差内相等的深度归入同一组，组内保持输入顺序，
+    # 再按各组首个片元的深度排序，从而实现带容差的稳定排序。
+    groups = []  # [(anchor_depth, [fragment, ...]), ...]
+    for fragment in fragments:
+        depth = fragment["depth"]
+        for anchor, members in groups:
+            if abs(depth - anchor) <= TOL:
+                members.append(fragment)
+                break
+        else:
+            groups.append((depth, [fragment]))
+
+    groups.sort(key=lambda group: group[0])
+
+    ordered = []
+    for _, members in groups:
+        ordered.extend(members)
+    return ordered
 
 
 def peel(fragments, layers):
@@ -52,7 +83,31 @@ def peel(fragments, layers):
       ``len(fragments) - sum(len(layer) for layer in result)`` 计算。
     - 深度相等按 1e-9 容差判定。
     """
-    raise NotImplementedError
+    if layers <= 0:
+        return []
+
+    # 用下标列表表示“剩余集合”，每轮弹出被选中的下标——剥离即移除，
+    # 同深度片元因此会一轮一个、按输入顺序逐层消耗。
+    remaining = list(range(len(fragments)))
+    result = []
+
+    for _ in range(layers):
+        if not remaining:
+            break
+
+        best_pos = 0
+        best_depth = fragments[remaining[0]]["depth"]
+        for pos in range(1, len(remaining)):
+            depth = fragments[remaining[pos]]["depth"]
+            # 仅当严格更小（超出容差）才替换；容差内相等保留更早的片元。
+            if depth < best_depth - TOL:
+                best_pos = pos
+                best_depth = depth
+
+        index = remaining.pop(best_pos)
+        result.append([fragments[index]])
+
+    return result
 
 
 def resolve_layer(layer, background):
@@ -76,7 +131,10 @@ def resolve_layer(layer, background):
     ----
     1e-9。
     """
-    raise NotImplementedError
+    out = tuple(background)
+    for fragment in reversed(layer):
+        out = _over(fragment["rgba"], out)
+    return out
 
 
 def combine(layers, background):
@@ -101,7 +159,11 @@ def combine(layers, background):
     ----
     1e-9。
     """
-    raise NotImplementedError
+    out = tuple(background)
+    for layer in reversed(layers):
+        for fragment in reversed(layer):
+            out = _over(fragment["rgba"], out)
+    return out
 
 
 def reference(fragments, background):
@@ -112,7 +174,10 @@ def reference(fragments, background):
       片元都被剥离时应一致。
     - 返回预乘 RGBA ``tuple``；容差 1e-9。
     """
-    raise NotImplementedError
+    out = tuple(background)
+    for fragment in reversed(sort_layers(fragments)):
+        out = _over(fragment["rgba"], out)
+    return out
 
 
 def depth_epsilon(scale):
@@ -127,7 +192,7 @@ def depth_epsilon(scale):
     因此 ``scale`` 为 0 时退化为 1e-9 下限，远距离时阈值线性增大，
     不会用一个固定常量把远近不同的层错误合并。
     """
-    raise NotImplementedError
+    return max(TOL, abs(scale) * 2.0 ** -24)
 
 
 def layer_stats(layers):
@@ -146,7 +211,25 @@ def layer_stats(layers):
     ----
     1e-9。
     """
-    raise NotImplementedError
+    counts = [len(layer) for layer in layers]
+    fragment_count = sum(counts)
+
+    if fragment_count == 0:
+        coverage = 0.0
+    else:
+        unseen = 1.0
+        for layer in layers:
+            for fragment in layer:
+                unseen *= 1.0 - fragment["rgba"][3]
+        coverage = 1.0 - unseen
+        coverage = min(1.0, max(0.0, coverage))
+
+    return {
+        "layer_count": len(layers),
+        "counts": counts,
+        "fragment_count": fragment_count,
+        "coverage": coverage,
+    }
 
 
 def validate_layers(layers, max_layers):
@@ -166,4 +249,23 @@ def validate_layers(layers, max_layers):
     ----
     1e-9。
     """
-    raise NotImplementedError
+    errors = []
+
+    if len(layers) > max_layers:
+        errors.append("layer_count_exceeded")
+
+    for index, layer in enumerate(layers):
+        if len(layer) == 0:
+            errors.append("empty_layer:{0}".format(index))
+
+    previous_depth = None
+    for index, layer in enumerate(layers):
+        if len(layer) == 0:
+            # 空层不参与深度递增比较。
+            continue
+        depth = layer[0]["depth"]
+        if previous_depth is not None and depth < previous_depth - TOL:
+            errors.append("depth_order:{0}".format(index))
+        previous_depth = depth
+
+    return errors
